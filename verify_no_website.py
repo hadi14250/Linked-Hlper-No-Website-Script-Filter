@@ -6,6 +6,22 @@ import time
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+def is_real_website(value: str) -> bool:
+    v = norm(value).lower()
+    if not v:
+        return False
+    if not (v.startswith("http://") or v.startswith("https://")):
+        v = "http://" + v
+
+    # These should NOT count as "a website"
+    if "linkedin.com" in v:
+        return False
+    if "lnkd.in" in v:
+        return False
+
+    return True
+
+
 def detect_delimiter(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         sample = f.read(50000)
@@ -97,8 +113,16 @@ def pick_latest_org_slot(row, org_ids):
 
     present_candidates = [c for c in candidates if c[1] is True]
     if present_candidates:
-        # Deterministic: choose the smallest slot index among current roles
-        return sorted(present_candidates, key=lambda x: x[0])[0][0]
+        # Prefer the "most recent start date" among present roles
+        # candidates tuple: (i, present, end_dt, start_dt)
+        def key(c):
+            i, present, end_dt, start_dt = c
+            start_key = pd.Timestamp.min if pd.isna(start_dt) else start_dt
+            return (start_key, -i)
+
+        best = sorted(present_candidates, key=key, reverse=True)[0]
+        return best[0]
+
 
     # No current job: pick most recent end date, then most recent start date, then smallest index
     candidates_sorted = sorted(
@@ -156,10 +180,7 @@ def extract_company_website_from_about_strict(page) -> str:
         const h = href.toLowerCase();
         if (!h.startsWith('http')) return false;
 
-        // Exclude all LinkedIn links (they are not real websites)
         if (h.includes('linkedin.com')) return false;
-
-        // Exclude shortened or redirect LinkedIn domains
         if (h.includes('lnkd.in')) return false;
 
         return true;
@@ -239,14 +260,17 @@ def main():
             website_csv = norm(row.get(f"organization_website_{latest_i}", ""))
             domain_csv = norm(row.get(f"organization_domain_{latest_i}", ""))
 
-            # If CSV already contains website or domain for the latest company, exclude deterministically
-            if website_csv or domain_csv:
+            csv_site = website_csv if is_real_website(website_csv) else ""
+            if not csv_site:
+                csv_site = domain_csv if is_real_website(domain_csv) else ""
+
+            if csv_site:
                 audit_rows.append({
                     "profile": profile_link,
                     "latest_company_slot": str(latest_i),
                     "company_name": company_name,
                     "company_page": company_page,
-                    "company_website": website_csv or domain_csv,
+                    "company_website": csv_site,
                     "status": "excluded_latest_company_has_website"
                 })
                 continue
