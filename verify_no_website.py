@@ -105,6 +105,36 @@ def get_profile_link(row):
         return f"https://www.linkedin.com/in/{public_id}/"
     return ""
 
+def get_profile_name(row) -> str:
+    for k in ["full_name", "fullname", "name", "profile_name", "person_name"]:
+        v = norm(row.get(k, ""))
+        if v:
+            return v
+    fn = norm(row.get("first_name", "")) or norm(row.get("first name", ""))
+    ln = norm(row.get("last_name", "")) or norm(row.get("last name", ""))
+    if fn or ln:
+        return (fn + " " + ln).strip()
+    return ""
+
+def get_role_for_org(row, i: int) -> str:
+    keys = [
+        f"organization_title_{i}",
+        f"organization_role_{i}",
+        f"organization_position_{i}",
+        f"organization_job_title_{i}",
+        f"title_{i}",
+        "current_title",
+        "title",
+        "headline",
+        "position",
+        "job_title",
+    ]
+    for k in keys:
+        v = norm(row.get(k, ""))
+        if v:
+            return v
+    return ""
+
 def is_present_value(s: str) -> bool:
     t = norm(s).lower()
     if not t:
@@ -338,6 +368,33 @@ def extract_company_website_from_about_fallback(page) -> str:
     except Exception:
         return ""
 
+def extract_company_headcount(page) -> str:
+    js = """
+    () => {
+      const root = document.querySelector('main') || document.body;
+      if (!root) return '';
+      const text = (root.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      if (!text) return '';
+
+      const patterns = [
+        /(\\d+[\\d,\\.\\s]*)\\s*employees\\b/,
+        /(\\d+[\\d,\\.\\s]*)\\s*employee\\b/,
+        /(\\d+[\\d,\\.\\s]*)\\s*employees\\s*on\\s*linkedin\\b/
+      ];
+
+      for (const p of patterns) {
+        const m = text.match(p);
+        if (m && m[0]) return m[0];
+      }
+      return '';
+    }
+    """
+    try:
+        v = page.evaluate(js)
+        return (v or "").strip()
+    except Exception:
+        return ""
+
 def ensure_parent_dir(path: str):
     d = os.path.dirname(os.path.abspath(path))
     if d and not os.path.exists(d):
@@ -367,13 +424,11 @@ def load_progress(progress_path: str) -> dict:
         return {}
 
 def goto_with_retries(page, url: str, timeout_ms: int = 30000, max_attempts: int = 3):
-    last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             return True
-        except Exception as e:
-            last_exc = e
+        except Exception:
             if attempt < max_attempts:
                 time.sleep(random.uniform(5.0, 15.0))
                 continue
@@ -405,6 +460,36 @@ def write_final_outputs(kept_progress_csv: str, audit_progress_csv: str, out_no_
 
     return len(out_df), len(audit_df)
 
+def write_summary_output(summary_progress_csv: str, out_summary_xlsx: str):
+    if os.path.exists(summary_progress_csv) and os.path.getsize(summary_progress_csv) > 0:
+        df = pd.read_csv(summary_progress_csv, encoding="utf-8", dtype=str, keep_default_na=False)
+    else:
+        df = pd.DataFrame(columns=[
+            "profile_name",
+            "company_name",
+            "role",
+            "company_website",
+            "company_linkedin_page",
+            "headcount"
+        ])
+
+    with pd.ExcelWriter(out_summary_xlsx, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="summary")
+
+    return len(df)
+
+def normalize_company_website_for_summary(found_site: str, company_page: str) -> str:
+    s = norm(found_site)
+    if not s:
+        return "no website"
+    low = s.lower()
+    if "linkedin.com" in low or "lnkd.in" in low:
+        return "no website"
+    return s
+
+def company_page_for_summary(company_page: str) -> str:
+    return norm(company_page) if norm(company_page) else "no page"
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python3 verify_no_website.py <input_csv>")
@@ -424,13 +509,16 @@ def main():
     base = os.path.splitext(input_csv)[0]
     out_no_site_csv = base + "_CONFIRMED_NO_WEBSITE.csv"
     out_audit_xlsx = base + "_LATEST_COMPANY_AUDIT.xlsx"
+    out_summary_xlsx = base + "_LATEST_COMPANY_SUMMARY.xlsx"
 
     progress_path = base + "_PROGRESS.json"
     audit_progress_csv = base + "_AUDIT_PROGRESS.csv"
     kept_progress_csv = base + "_KEPT_PROGRESS.csv"
+    summary_progress_csv = base + "_SUMMARY_PROGRESS.csv"
 
     audit_fields = ["profile", "latest_company_slot", "company_name", "company_page", "company_website", "status"]
     kept_fields = list(df.columns)
+    summary_fields = ["profile_name", "company_name", "role", "company_website", "company_linkedin_page", "headcount"]
 
     state = load_progress(progress_path)
     processed = set(state.get("processed_indices", []))
@@ -464,6 +552,7 @@ def main():
 
             latest_i = pick_target_org_slot_by_current_company(row, org_ids)
             profile_link = get_profile_link(row)
+            profile_name = get_profile_name(row)
             current_company_name = get_current_company_name(row)
 
             if latest_i is None:
@@ -476,34 +565,23 @@ def main():
                     "status": "kept_current_company_not_found_in_organizations"
                 }
                 append_dict_row_csv(audit_progress_csv, audit_row, audit_fields)
+
                 append_dict_row_csv(kept_progress_csv, {k: norm(row.get(k, "")) for k in kept_fields}, kept_fields)
+
+                summary_row = {
+                    "profile_name": profile_name,
+                    "company_name": current_company_name,
+                    "role": get_role_for_org(row, latest_i) if latest_i is not None else "",
+                    "company_website": "no website",
+                    "company_linkedin_page": "no page",
+                    "headcount": ""
+                }
+                append_dict_row_csv(summary_progress_csv, summary_row, summary_fields)
+
                 kept_count += 1
                 processed.add(idx)
                 processed_count += 1
-                if processed_count % flush_every == 0:
-                    save_progress(progress_path, {
-                        "processed_indices": sorted(list(processed)),
-                        "nav_count": nav_count,
-                        "processed_count": processed_count,
-                        "kept_count": kept_count,
-                        "excluded_count": excluded_count
-                    })
-                if processed_count % 10 == 0:
-                    print(f"Processed: {processed_count} | Kept: {kept_count} | Excluded: {excluded_count} | Navigations: {nav_count}")
-                continue
 
-            if latest_i is None:
-                audit_row = {
-                    "profile": profile_link,
-                    "latest_company_slot": "",
-                    "company_name": "",
-                    "company_page": "",
-                    "company_website": "",
-                    "status": "skipped_no_company_found"
-                }
-                append_dict_row_csv(audit_progress_csv, audit_row, audit_fields)
-                processed.add(idx)
-                processed_count += 1
                 if processed_count % flush_every == 0:
                     save_progress(progress_path, {
                         "processed_indices": sorted(list(processed)),
@@ -518,6 +596,7 @@ def main():
 
             company_name = norm(row.get(f"organization_{latest_i}", ""))
             company_page = norm(row.get(f"organization_url_{latest_i}", ""))
+            role = get_role_for_org(row, latest_i)
 
             website_csv = norm(row.get(f"organization_website_{latest_i}", ""))
             domain_csv = norm(row.get(f"organization_domain_{latest_i}", ""))
@@ -536,9 +615,21 @@ def main():
                     "status": "excluded_latest_company_has_website"
                 }
                 append_dict_row_csv(audit_progress_csv, audit_row, audit_fields)
+
+                summary_row = {
+                    "profile_name": profile_name,
+                    "company_name": company_name,
+                    "role": role,
+                    "company_website": normalize_company_website_for_summary(csv_site, company_page),
+                    "company_linkedin_page": company_page_for_summary(company_page),
+                    "headcount": ""
+                }
+                append_dict_row_csv(summary_progress_csv, summary_row, summary_fields)
+
                 excluded_count += 1
                 processed.add(idx)
                 processed_count += 1
+
                 if processed_count % flush_every == 0:
                     save_progress(progress_path, {
                         "processed_indices": sorted(list(processed)),
@@ -561,10 +652,23 @@ def main():
                     "status": "kept_latest_company_no_page_url"
                 }
                 append_dict_row_csv(audit_progress_csv, audit_row, audit_fields)
+
                 append_dict_row_csv(kept_progress_csv, {k: norm(row.get(k, "")) for k in kept_fields}, kept_fields)
+
+                summary_row = {
+                    "profile_name": profile_name,
+                    "company_name": company_name,
+                    "role": role,
+                    "company_website": "no website",
+                    "company_linkedin_page": "no page",
+                    "headcount": ""
+                }
+                append_dict_row_csv(summary_progress_csv, summary_row, summary_fields)
+
                 kept_count += 1
                 processed.add(idx)
                 processed_count += 1
+
                 if processed_count % flush_every == 0:
                     save_progress(progress_path, {
                         "processed_indices": sorted(list(processed)),
@@ -588,10 +692,23 @@ def main():
                     "status": "kept_latest_company_no_page_url"
                 }
                 append_dict_row_csv(audit_progress_csv, audit_row, audit_fields)
+
                 append_dict_row_csv(kept_progress_csv, {k: norm(row.get(k, "")) for k in kept_fields}, kept_fields)
+
+                summary_row = {
+                    "profile_name": profile_name,
+                    "company_name": company_name,
+                    "role": role,
+                    "company_website": "no website",
+                    "company_linkedin_page": company_page_for_summary(company_page),
+                    "headcount": ""
+                }
+                append_dict_row_csv(summary_progress_csv, summary_row, summary_fields)
+
                 kept_count += 1
                 processed.add(idx)
                 processed_count += 1
+
                 if processed_count % flush_every == 0:
                     save_progress(progress_path, {
                         "processed_indices": sorted(list(processed)),
@@ -605,6 +722,7 @@ def main():
                 continue
 
             ok = goto_with_retries(page, about_url, timeout_ms=30000, max_attempts=3)
+            headcount = ""
             if ok:
                 nav_count += 1
                 human_pause()
@@ -621,10 +739,23 @@ def main():
                     "status": "kept_latest_company_browser_error"
                 }
                 append_dict_row_csv(audit_progress_csv, audit_row, audit_fields)
+
                 append_dict_row_csv(kept_progress_csv, {k: norm(row.get(k, "")) for k in kept_fields}, kept_fields)
+
+                summary_row = {
+                    "profile_name": profile_name,
+                    "company_name": company_name,
+                    "role": role,
+                    "company_website": "no website",
+                    "company_linkedin_page": company_page_for_summary(company_page),
+                    "headcount": ""
+                }
+                append_dict_row_csv(summary_progress_csv, summary_row, summary_fields)
+
                 kept_count += 1
                 processed.add(idx)
                 processed_count += 1
+
                 if processed_count % flush_every == 0:
                     save_progress(progress_path, {
                         "processed_indices": sorted(list(processed)),
@@ -658,10 +789,23 @@ def main():
                     "status": "kept_latest_company_page_missing"
                 }
                 append_dict_row_csv(audit_progress_csv, audit_row, audit_fields)
+
                 append_dict_row_csv(kept_progress_csv, {k: norm(row.get(k, "")) for k in kept_fields}, kept_fields)
+
+                summary_row = {
+                    "profile_name": profile_name,
+                    "company_name": company_name,
+                    "role": role,
+                    "company_website": "no website",
+                    "company_linkedin_page": company_page_for_summary(company_page),
+                    "headcount": ""
+                }
+                append_dict_row_csv(summary_progress_csv, summary_row, summary_fields)
+
                 kept_count += 1
                 processed.add(idx)
                 processed_count += 1
+
                 if processed_count % flush_every == 0:
                     save_progress(progress_path, {
                         "processed_indices": sorted(list(processed)),
@@ -673,6 +817,8 @@ def main():
                 if processed_count % 10 == 0:
                     print(f"Processed: {processed_count} | Kept: {kept_count} | Excluded: {excluded_count} | Navigations: {nav_count}")
                 continue
+
+            headcount = extract_company_headcount(page)
 
             site = extract_company_website_from_about_strict(page)
             if not site:
@@ -690,9 +836,21 @@ def main():
                     "status": "excluded_latest_company_has_website"
                 }
                 append_dict_row_csv(audit_progress_csv, audit_row, audit_fields)
+
+                summary_row = {
+                    "profile_name": profile_name,
+                    "company_name": company_name,
+                    "role": role,
+                    "company_website": normalize_company_website_for_summary(site, company_page),
+                    "company_linkedin_page": company_page_for_summary(company_page),
+                    "headcount": headcount
+                }
+                append_dict_row_csv(summary_progress_csv, summary_row, summary_fields)
+
                 excluded_count += 1
                 processed.add(idx)
                 processed_count += 1
+
                 if processed_count % flush_every == 0:
                     save_progress(progress_path, {
                         "processed_indices": sorted(list(processed)),
@@ -714,7 +872,19 @@ def main():
                 "status": "kept_latest_company_no_website"
             }
             append_dict_row_csv(audit_progress_csv, audit_row, audit_fields)
+
             append_dict_row_csv(kept_progress_csv, {k: norm(row.get(k, "")) for k in kept_fields}, kept_fields)
+
+            summary_row = {
+                "profile_name": profile_name,
+                "company_name": company_name,
+                "role": role,
+                "company_website": "no website",
+                "company_linkedin_page": company_page_for_summary(company_page),
+                "headcount": headcount
+            }
+            append_dict_row_csv(summary_progress_csv, summary_row, summary_fields)
+
             kept_count += 1
             processed.add(idx)
             processed_count += 1
@@ -746,11 +916,18 @@ def main():
         out_audit_xlsx=out_audit_xlsx
     )
 
+    summary_rows_written = write_summary_output(
+        summary_progress_csv=summary_progress_csv,
+        out_summary_xlsx=out_summary_xlsx
+    )
+
     print("Done.")
     print("Input rows:", len(df))
     print("Kept rows:", kept_rows_written)
     print("Saved:", out_no_site_csv)
     print("Audit saved:", out_audit_xlsx)
+    print("Summary saved:", out_summary_xlsx)
+    print("Summary rows:", summary_rows_written)
 
 if __name__ == "__main__":
     main()
