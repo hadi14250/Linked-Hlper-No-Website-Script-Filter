@@ -14,7 +14,7 @@ def detect_delimiter(path: str) -> str:
     except Exception:
         return ";"
 
-def safe_read_csv(path):
+def safe_read_csv(path: str) -> pd.DataFrame:
     delim = detect_delimiter(path)
     rows = []
     with open(path, "r", encoding="utf-8", errors="ignore", newline="") as f:
@@ -34,8 +34,6 @@ def safe_read_csv(path):
     for r in rows[1:]:
         if len(r) == len(header):
             data.append(r)
-        else:
-            continue
 
     return pd.DataFrame(data, columns=header)
 
@@ -53,6 +51,67 @@ def find_org_ids(cols):
             ids.add(int(m.group(1)))
     return sorted(ids)
 
+def get_profile_link(row):
+    for key in ["profile_url", "profile_link", "linkedin_url", "url", "public_profile_url"]:
+        if key in row and norm(row.get(key, "")):
+            return norm(row.get(key, ""))
+    public_id = norm(row.get("public_id", "")) or norm(row.get("public-id", ""))
+    if public_id:
+        return f"https://www.linkedin.com/in/{public_id}/"
+    return ""
+
+def is_present_value(s: str) -> bool:
+    t = norm(s).lower()
+    if not t:
+        return True
+    return "present" in t or "current" in t or t in ["now", "today"]
+
+def parse_date_loose(s: str):
+    t = norm(s)
+    if not t:
+        return pd.NaT
+    try:
+        return pd.to_datetime(t, errors="coerce", infer_datetime_format=True, utc=False)
+    except Exception:
+        return pd.NaT
+
+def pick_latest_org_slot(row, org_ids):
+    candidates = []
+    for i in org_ids:
+        org_name = norm(row.get(f"organization_{i}", ""))
+        if not org_name:
+            continue
+
+        end_val = norm(row.get(f"organization_end_{i}", "")) or norm(row.get(f"organization_end_date_{i}", ""))
+        start_val = norm(row.get(f"organization_start_{i}", "")) or norm(row.get(f"organization_start_date_{i}", ""))
+
+        present = is_present_value(end_val)
+
+        end_dt = pd.Timestamp.max if present else parse_date_loose(end_val)
+        start_dt = parse_date_loose(start_val)
+
+        candidates.append((i, present, end_dt, start_dt))
+
+    if not candidates:
+        return None
+
+    present_candidates = [c for c in candidates if c[1] is True]
+    if present_candidates:
+        # Deterministic: choose the smallest slot index among current roles
+        return sorted(present_candidates, key=lambda x: x[0])[0][0]
+
+    # No current job: pick most recent end date, then most recent start date, then smallest index
+    candidates_sorted = sorted(
+        candidates,
+        key=lambda x: (
+            pd.Timestamp.min if pd.isna(x[2]) else x[2],
+            pd.Timestamp.min if pd.isna(x[3]) else x[3],
+            -x[0]
+        ),
+        reverse=True
+    )
+    return candidates_sorted[0][0]
+
 def to_about_url(company_url: str) -> str:
     u = norm(company_url)
     if not u:
@@ -61,40 +120,60 @@ def to_about_url(company_url: str) -> str:
         u += "/"
     return u + "about/"
 
-def extract_company_website_from_about(page) -> str:
+def page_looks_missing_or_unavailable(page) -> bool:
+    try:
+        body = page.inner_text("body").lower()
+    except Exception:
+        return True
+    markers = [
+        "this page doesn’t exist",
+        "this page doesn't exist",
+        "page not found",
+        "doesn’t exist",
+        "doesn't exist",
+        "unavailable",
+        "something went wrong",
+        "profile not found",
+        "we couldn't find",
+    ]
+    return any(m in body for m in markers)
+
+def extract_company_website_from_about_strict(page) -> str:
     try:
         page.wait_for_load_state("domcontentloaded", timeout=15000)
     except Exception:
         pass
 
-    time.sleep(1.2)
+    time.sleep(1.0)
 
-    try:
-        body = page.inner_text("body").lower()
-    except Exception:
-        return ""
-
-    if "website" not in body:
+    if page_looks_missing_or_unavailable(page):
         return ""
 
     js = """
     () => {
-      function isExternalHttp(href) {
+        function isExternalHttp(href) {
         if (!href) return false;
         const h = href.toLowerCase();
         if (!h.startsWith('http')) return false;
+
+        // Exclude all LinkedIn links (they are not real websites)
         if (h.includes('linkedin.com')) return false;
+
+        // Exclude shortened or redirect LinkedIn domains
+        if (h.includes('lnkd.in')) return false;
+
         return true;
-      }
+        }
 
       const labelNodes = Array.from(document.querySelectorAll('*'))
         .filter(el => el && el.innerText && el.innerText.trim().toLowerCase() === 'website')
-        .slice(0, 10);
+        .slice(0, 30);
 
       const candidates = [];
+
       for (const label of labelNodes) {
         let container = label.parentElement;
-        for (let i = 0; i < 4 && container; i++) {
+        for (let i = 0; i < 6 && container; i++) {
           const links = Array.from(container.querySelectorAll('a'))
             .map(a => a.href)
             .filter(isExternalHttp);
@@ -103,29 +182,14 @@ def extract_company_website_from_about(page) -> str:
         }
       }
 
-      if (candidates.length) return candidates[0];
-
-      const any = Array.from(document.querySelectorAll('a'))
-        .map(a => a.href)
-        .filter(isExternalHttp);
-
-      return any[0] || '';
+      return candidates[0] || '';
     }
     """
     try:
         href = page.evaluate(js)
-        return norm(href)
+        return href.strip() if href else ""
     except Exception:
         return ""
-
-def get_profile_link(row):
-    for key in ["profile_url", "profile_link", "linkedin_url", "url", "public_profile_url"]:
-        if key in row and norm(row.get(key, "")):
-            return norm(row.get(key, ""))
-    public_id = norm(row.get("public_id", ""))
-    if public_id:
-        return f"https://www.linkedin.com/in/{public_id}/"
-    return ""
 
 def main():
     if len(sys.argv) < 2:
@@ -138,14 +202,13 @@ def main():
         sys.exit(1)
 
     df = safe_read_csv(input_csv)
-
     org_ids = find_org_ids(df.columns)
     if not org_ids:
         print("No organization_X columns found in CSV.")
         sys.exit(1)
 
     out_no_site_csv = os.path.splitext(input_csv)[0] + "_CONFIRMED_NO_WEBSITE.csv"
-    out_audit_xlsx = os.path.splitext(input_csv)[0] + "_COMPANY_WEBSITE_AUDIT.xlsx"
+    out_audit_xlsx = os.path.splitext(input_csv)[0] + "_LATEST_COMPANY_AUDIT.xlsx"
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
@@ -156,88 +219,123 @@ def main():
         audit_rows = []
 
         for _, row in df.iterrows():
-            any_org = False
-            any_site_in_export = False
-
-            org_slots = []
-            for i in org_ids:
-                org = norm(row.get(f"organization_{i}", ""))
-                if not org:
-                    continue
-                any_org = True
-
-                website = norm(row.get(f"organization_website_{i}", ""))
-                domain = norm(row.get(f"organization_domain_{i}", ""))
-                org_url = norm(row.get(f"organization_url_{i}", ""))
-
-                if website or domain:
-                    any_site_in_export = True
-                    break
-
-                if org_url:
-                    org_slots.append((i, org, org_url))
-
-            if not any_org:
-                continue
-
+            latest_i = pick_latest_org_slot(row, org_ids)
             profile_link = get_profile_link(row)
 
-            if any_site_in_export:
-                for i, org_name, org_url in org_slots:
-                    audit_rows.append({
-                        "company_name": org_name,
-                        "profile": profile_link,
-                        "company_page": org_url,
-                        "company_website": "(present in CSV via website/domain fields)"
-                    })
-                continue
-
-            if not org_slots:
-                continue
-
-            found_external_site = ""
-            found_company = ""
-            found_company_url = ""
-
-            for i, org_name, org_url in org_slots:
-                about_url = to_about_url(org_url)
-                if not about_url:
-                    continue
-                try:
-                    page.goto(about_url, wait_until="domcontentloaded", timeout=30000)
-                except PlaywrightTimeoutError:
-                    continue
-
-                site = extract_company_website_from_about(page)
-                if site:
-                    found_external_site = site
-                    found_company = org_name
-                    found_company_url = org_url
-                    break
-
-            if found_external_site:
+            if latest_i is None:
                 audit_rows.append({
-                    "company_name": found_company,
                     "profile": profile_link,
-                    "company_page": found_company_url,
-                    "company_website": found_external_site
+                    "latest_company_slot": "",
+                    "company_name": "",
+                    "company_page": "",
+                    "company_website": "",
+                    "status": "skipped_no_company_found"
                 })
                 continue
 
-            for i, org_name, org_url in org_slots:
-                audit_rows.append({
-                    "company_name": org_name,
-                    "profile": profile_link,
-                    "company_page": org_url,
-                    "company_website": ""
-                })
+            company_name = norm(row.get(f"organization_{latest_i}", ""))
+            company_page = norm(row.get(f"organization_url_{latest_i}", ""))
 
+            website_csv = norm(row.get(f"organization_website_{latest_i}", ""))
+            domain_csv = norm(row.get(f"organization_domain_{latest_i}", ""))
+
+            # If CSV already contains website or domain for the latest company, exclude deterministically
+            if website_csv or domain_csv:
+                audit_rows.append({
+                    "profile": profile_link,
+                    "latest_company_slot": str(latest_i),
+                    "company_name": company_name,
+                    "company_page": company_page,
+                    "company_website": website_csv or domain_csv,
+                    "status": "excluded_latest_company_has_website"
+                })
+                continue
+
+            # If there is no company page URL for the latest company, keep
+            if not company_page:
+                audit_rows.append({
+                    "profile": profile_link,
+                    "latest_company_slot": str(latest_i),
+                    "company_name": company_name,
+                    "company_page": "",
+                    "company_website": "",
+                    "status": "kept_latest_company_no_page_url"
+                })
+                kept_rows.append(row)
+                continue
+
+            about_url = to_about_url(company_page)
+            if not about_url:
+                audit_rows.append({
+                    "profile": profile_link,
+                    "latest_company_slot": str(latest_i),
+                    "company_name": company_name,
+                    "company_page": company_page,
+                    "company_website": "",
+                    "status": "kept_latest_company_no_page_url"
+                })
+                kept_rows.append(row)
+                continue
+
+            try:
+                page.goto(about_url, wait_until="domcontentloaded", timeout=30000)
+            except PlaywrightTimeoutError:
+                audit_rows.append({
+                    "profile": profile_link,
+                    "latest_company_slot": str(latest_i),
+                    "company_name": company_name,
+                    "company_page": company_page,
+                    "company_website": "",
+                    "status": "kept_latest_company_page_missing"
+                })
+                kept_rows.append(row)
+                continue
+
+            if page_looks_missing_or_unavailable(page):
+                audit_rows.append({
+                    "profile": profile_link,
+                    "latest_company_slot": str(latest_i),
+                    "company_name": company_name,
+                    "company_page": company_page,
+                    "company_website": "",
+                    "status": "kept_latest_company_page_missing"
+                })
+                kept_rows.append(row)
+                continue
+
+            site = extract_company_website_from_about_strict(page)
+            if site:
+                audit_rows.append({
+                    "profile": profile_link,
+                    "latest_company_slot": str(latest_i),
+                    "company_name": company_name,
+                    "company_page": company_page,
+                    "company_website": site,
+                    "status": "excluded_latest_company_has_website"
+                })
+                continue
+
+            audit_rows.append({
+                "profile": profile_link,
+                "latest_company_slot": str(latest_i),
+                "company_name": company_name,
+                "company_page": company_page,
+                "company_website": "",
+                "status": "kept_latest_company_no_website"
+            })
             kept_rows.append(row)
 
         out_df = pd.DataFrame(kept_rows)
         out_df.to_csv(out_no_site_csv, index=False, encoding="utf-8-sig")
 
-        audit_df = pd.DataFrame(audit_rows, columns=["company_name", "profile", "company_page", "company_website"])
+        audit_df = pd.DataFrame(audit_rows, columns=[
+            "profile",
+            "latest_company_slot",
+            "company_name",
+            "company_page",
+            "company_website",
+            "status"
+        ])
         with pd.ExcelWriter(out_audit_xlsx, engine="openpyxl") as writer:
             audit_df.to_excel(writer, index=False, sheet_name="audit")
 
