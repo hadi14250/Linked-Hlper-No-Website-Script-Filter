@@ -6,6 +6,34 @@ import time
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+def normalize_name(s: str) -> str:
+    t = norm(s).lower()
+    t = re.sub(r"[^a-z0-9]+", "", t)
+    return t
+
+def get_current_company_name(row) -> str:
+    a = norm(row.get("original_current_company", ""))
+    b = norm(row.get("current_company", ""))
+    return a or b
+
+def pick_target_org_slot_by_current_company(row, org_ids):
+    target = normalize_name(get_current_company_name(row))
+    if not target:
+        return None
+
+    matches = []
+    for i in org_ids:
+        org_name = norm(row.get(f"organization_{i}", ""))
+        if not org_name:
+            continue
+        if normalize_name(org_name) == target:
+            matches.append(i)
+
+    if matches:
+        return sorted(matches)[0]
+
+    return None
+
 def is_real_website(value: str) -> bool:
     v = norm(value).lower()
     if not v:
@@ -240,8 +268,21 @@ def main():
         audit_rows = []
 
         for _, row in df.iterrows():
-            latest_i = pick_latest_org_slot(row, org_ids)
+            latest_i = pick_target_org_slot_by_current_company(row, org_ids)
             profile_link = get_profile_link(row)
+            current_company_name = get_current_company_name(row)
+
+            if latest_i is None:
+                audit_rows.append({
+                    "profile": profile_link,
+                    "latest_company_slot": "",
+                    "company_name": current_company_name,
+                    "company_page": "",
+                    "company_website": "",
+                    "status": "kept_current_company_not_found_in_organizations"
+                })
+                kept_rows.append(row)
+                continue
 
             if latest_i is None:
                 audit_rows.append({
